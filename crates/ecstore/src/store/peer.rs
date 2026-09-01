@@ -1,0 +1,388 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::*;
+use crate::runtime::instance::InstanceContext;
+use crate::runtime::sources as runtime_sources;
+use tracing::{debug, error};
+
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_DISK_STARTUP: &str = "disk_startup";
+const EVENT_LOCAL_DISK_ID_PREWARM_SKIPPED: &str = "local_disk_id_prewarm_skipped";
+const EVENT_LOCK_CLIENT_INITIALIZATION_FAILED: &str = "lock_client_initialization_failed";
+
+async fn remember_local_disk_id(disk: &DiskStore) -> Option<Uuid> {
+    remember_local_disk_id_with_instance_ctx(&crate::runtime::global::current_ctx(), disk).await
+}
+
+async fn remember_local_disk_id_with_instance_ctx(instance_ctx: &Arc<InstanceContext>, disk: &DiskStore) -> Option<Uuid> {
+    let disk_id = disk.get_disk_id().await.ok().flatten()?;
+    record_local_disk_id_if_active(instance_ctx, disk, disk_id)
+        .await
+        .then_some(disk_id)
+}
+
+async fn record_local_disk_id_if_active(instance_ctx: &Arc<InstanceContext>, disk: &DiskStore, disk_id: Uuid) -> bool {
+    let endpoint = disk.endpoint().to_string();
+    let local_disk_map = instance_ctx.local_disk_map();
+    let local_disks = local_disk_map.read().await;
+    let Some(active_disk) = local_disks.get(&endpoint).and_then(Option::as_ref) else {
+        return false;
+    };
+    if !Arc::ptr_eq(active_disk, disk) {
+        return false;
+    }
+
+    // Lock order is local_disk_map -> local_disk_id_map so quarantine is the
+    // linearization point for rejecting an in-flight stale disk snapshot.
+    instance_ctx.local_disk_id_map().write().await.insert(disk_id, endpoint);
+    true
+}
+
+pub async fn find_local_disk(disk_path: &str) -> Option<DiskStore> {
+    runtime_sources::local_disk_by_path(disk_path).await
+}
+
+pub async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
+    if let Some(disk) = find_local_disk(disk_ref).await {
+        let _ = remember_local_disk_id(&disk).await;
+        return Some(disk);
+    }
+
+    let Ok(disk_id) = Uuid::parse_str(disk_ref) else {
+        return None;
+    };
+
+    if let Some(disk_path) = runtime_sources::local_disk_path_by_id(&disk_id).await
+        && let Some(disk) = find_local_disk(&disk_path).await
+    {
+        return Some(disk);
+    }
+
+    for disk in all_local_disk().await {
+        if remember_local_disk_id(&disk).await == Some(disk_id) {
+            return Some(disk);
+        }
+    }
+
+    None
+}
+
+pub async fn all_local_disk_path() -> Vec<String> {
+    runtime_sources::local_disk_paths().await
+}
+
+pub async fn all_local_disk() -> Vec<DiskStore> {
+    runtime_sources::local_disks().await
+}
+
+pub async fn prewarm_local_disk_id_map() {
+    prewarm_local_disk_id_map_with_instance_ctx(&crate::runtime::global::current_ctx()).await
+}
+
+/// Prewarm the disk-id map of an explicit instance context (Phase 5 follow-up,
+/// backlog#1052): startup passes the context whose disk map it just populated
+/// instead of resolving the process-level default.
+pub async fn prewarm_local_disk_id_map_with_instance_ctx(instance_ctx: &Arc<InstanceContext>) {
+    let disks: Vec<DiskStore> = instance_ctx
+        .local_disk_map()
+        .read()
+        .await
+        .values()
+        .filter_map(|v| v.as_ref().cloned())
+        .collect();
+    for disk in disks {
+        if let Err(err) = disk.get_disk_id().await {
+            debug!(
+                event = EVENT_LOCAL_DISK_ID_PREWARM_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_DISK_STARTUP,
+                disk_endpoint = %disk.endpoint(),
+                error = %err,
+                "Skipped local disk id prewarm"
+            );
+            continue;
+        }
+
+        let _ = remember_local_disk_id_with_instance_ctx(instance_ctx, &disk).await;
+    }
+}
+
+pub async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
+    init_local_disks_with_instance_ctx(&crate::runtime::global::current_ctx(), endpoint_pools).await
+}
+
+/// Register the pools' local disks into an explicit instance context (Phase 5
+/// follow-up, backlog#1052). The legacy [`init_local_disks`] entry resolves the
+/// process-level default context; startup paths that own a context pass it here
+/// so a future second instance's disks cannot leak into the first one's registry.
+pub async fn init_local_disks_with_instance_ctx(
+    instance_ctx: &Arc<InstanceContext>,
+    endpoint_pools: EndpointServerPools,
+) -> Result<()> {
+    let opt = &DiskOption {
+        cleanup: true,
+        health_check: true,
+    };
+
+    runtime_sources::initialize_local_disk_maps(instance_ctx, endpoint_pools, opt).await
+}
+
+pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
+    let mut unique_endpoints: HashMap<String, &Endpoint> = HashMap::new();
+
+    for pool_eps in endpoint_pools.as_ref().iter() {
+        for ep in pool_eps.endpoints.as_ref().iter() {
+            unique_endpoints.insert(ep.host_port(), ep);
+        }
+    }
+
+    let mut clients = HashMap::new();
+    let mut first_local_client_set = false;
+
+    for (key, endpoint) in unique_endpoints {
+        if endpoint.is_local {
+            let local_client = Arc::new(LocalClient::new()) as Arc<dyn LockClient>;
+
+            // Store the first LocalClient globally for use by other modules
+            if !first_local_client_set {
+                if let Err(e) = runtime_sources::set_primary_lock_client(local_client.clone()) {
+                    // If already set, ignore the error (another thread may have set it)
+                    debug!(
+                        event = EVENT_LOCK_CLIENT_INITIALIZATION_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_STARTUP,
+                        error = ?e,
+                        reason = "global_lock_client_already_set",
+                        "Skipped global lock client publication"
+                    );
+                } else {
+                    first_local_client_set = true;
+                }
+            }
+
+            clients.insert(key, local_client);
+        } else {
+            clients.insert(key, Arc::new(RemoteClient::new(endpoint.url.to_string())) as Arc<dyn LockClient>);
+        }
+    }
+
+    // Store the lock clients map globally
+    if runtime_sources::set_lock_clients(clients).is_err() {
+        error!(
+            event = EVENT_LOCK_CLIENT_INITIALIZATION_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_DISK_STARTUP,
+            reason = "set_global_lock_clients_failed",
+            "Failed to initialize lock clients"
+        );
+    }
+}
+
+fn endpoint_rpc_authority(endpoint: &Endpoint) -> Option<String> {
+    let host = endpoint.url.host_str()?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Some(match endpoint.url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+pub(super) async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: &String, port: &String) {
+    let mut peer_set = Vec::new();
+    endpoint_pools.as_ref().iter().for_each(|endpoints| {
+        endpoints.endpoints.as_ref().iter().for_each(|endpoint| {
+            if endpoint.get_type() == EndpointType::Url
+                && endpoint.is_local
+                && let Some(authority) = endpoint_rpc_authority(endpoint)
+            {
+                peer_set.push(authority);
+            }
+        });
+    });
+
+    if peer_set.is_empty() {
+        if !host.is_empty() {
+            runtime_sources::set_local_node_name(format!("{host}:{port}")).await;
+            return;
+        }
+
+        runtime_sources::set_local_node_name(format!("127.0.0.1:{port}")).await;
+        return;
+    }
+
+    runtime_sources::set_local_node_name(peer_set[0].clone()).await;
+}
+
+pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {
+    let opts = &DiskInfoOptions::default();
+    let mut res = vec![None; disks.len()];
+    for (idx, disk_op) in disks.iter().enumerate() {
+        if let Some(disk) = disk_op
+            && let Ok(info) = disk.disk_info(opts).await
+        {
+            res[idx] = Some(info);
+        }
+    }
+
+    res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk::new_disk;
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+
+    fn single_local_disk_pools(dir: &std::path::Path) -> EndpointServerPools {
+        let mut endpoint = Endpoint::try_from(dir.to_str().expect("temp dir path should be utf-8")).expect("local endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+
+        EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint]),
+            cmd_line: "instance-ctx-disk-registry-test".to_string(),
+            platform: "test".to_string(),
+        }])
+    }
+
+    #[test]
+    fn endpoint_rpc_authority_preserves_port_and_ipv6_brackets() {
+        let endpoint = Endpoint::try_from("https://127.0.0.1:9001/d1").expect("URL endpoint");
+        assert_eq!(endpoint_rpc_authority(&endpoint).as_deref(), Some("127.0.0.1:9001"));
+
+        let endpoint = Endpoint::try_from("https://[::1]:9002/d1").expect("IPv6 URL endpoint");
+        assert_eq!(endpoint_rpc_authority(&endpoint).as_deref(), Some("[::1]:9002"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn init_local_peer_publishes_complete_rpc_authority() {
+        let previous = rustfs_common::get_global_local_node_name().await;
+        let mut endpoint = Endpoint::try_from("https://127.0.0.1:9001/d1").expect("URL endpoint");
+        endpoint.is_local = true;
+        let endpoint_pools = EndpointServerPools(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            endpoints: Endpoints::from(vec![endpoint]),
+            cmd_line: "rpc-authority-test".to_string(),
+            platform: "test".to_string(),
+        }]);
+
+        let host = String::new();
+        let port = "9000".to_string();
+        init_local_peer(&endpoint_pools, &host, &port).await;
+        assert_eq!(rustfs_common::try_get_global_local_node_name().as_deref(), Some("127.0.0.1:9001"));
+        rustfs_common::set_global_local_node_name(&previous).await;
+    }
+
+    // Phase 5 follow-up (backlog#1052): registering local disks through the
+    // ctx-explicit entry writes the passed context's registry only — the
+    // process bootstrap context (and any other instance) stays clean, so a
+    // future second server's disks cannot leak into the first one's registry.
+    #[tokio::test]
+    async fn init_local_disks_with_instance_ctx_isolates_disk_registry() {
+        let temp_dir = tempfile::tempdir().expect("create temp disk dir");
+        let endpoint_pools = single_local_disk_pools(temp_dir.path());
+        let instance_ctx = Arc::new(InstanceContext::new());
+
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools)
+            .await
+            .expect("local disks should register into the passed context");
+
+        let registered: Vec<String> = instance_ctx.local_disk_map().read().await.keys().cloned().collect();
+        assert_eq!(registered.len(), 1, "the passed context must hold exactly the one local disk");
+        assert_eq!(
+            instance_ctx.local_disk_set_drives().read().await.len(),
+            1,
+            "the passed context must hold the pool/set/drive layout"
+        );
+
+        let bootstrap = crate::runtime::instance::bootstrap_ctx();
+        let bootstrap_map = bootstrap.local_disk_map();
+        let bootstrap_map = bootstrap_map.read().await;
+        let sibling = InstanceContext::new();
+        for key in &registered {
+            assert!(
+                !bootstrap_map.contains_key(key),
+                "bootstrap context must not absorb a disk registered into an explicit context"
+            );
+            assert!(
+                !sibling.local_disk_map().read().await.contains_key(key),
+                "a sibling context must not observe another instance's disks"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_local_disk_snapshot_cannot_repopulate_the_id_registry() {
+        let temp_dir = tempfile::tempdir().expect("create temp disk dir");
+        let endpoint_pools = single_local_disk_pools(temp_dir.path());
+        let instance_ctx = Arc::new(InstanceContext::new());
+        init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools)
+            .await
+            .expect("local disk should be registered");
+        let disk = instance_ctx
+            .local_disk_map()
+            .read()
+            .await
+            .values()
+            .find_map(|disk| disk.clone())
+            .expect("registered local disk");
+        let endpoint = disk.endpoint().to_string();
+        let disk_id = Uuid::new_v4();
+
+        let local_disk_map = instance_ctx.local_disk_map();
+        let mut quarantine = local_disk_map.write().await;
+        let replacement = new_disk(
+            &disk.endpoint(),
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("replacement disk should initialize");
+        assert!(!Arc::ptr_eq(&disk, &replacement));
+        let task_ctx = instance_ctx.clone();
+        let task_disk = disk.clone();
+        let remember = tokio::spawn(async move { record_local_disk_id_if_active(&task_ctx, &task_disk, disk_id).await });
+        tokio::task::yield_now().await;
+        quarantine.insert(endpoint.clone(), Some(replacement.clone()));
+        drop(quarantine);
+
+        assert!(!remember.await.expect("stale lookup task should complete"));
+        assert!(!instance_ctx.local_disk_id_map().read().await.contains_key(&disk_id));
+        let active = instance_ctx
+            .local_disk_map()
+            .read()
+            .await
+            .get(&endpoint)
+            .cloned()
+            .flatten()
+            .expect("replacement disk should remain registered");
+        assert!(Arc::ptr_eq(&active, &replacement));
+        assert!(record_local_disk_id_if_active(&instance_ctx, &replacement, disk_id).await);
+        assert_eq!(instance_ctx.local_disk_id_map().read().await.get(&disk_id), Some(&endpoint));
+    }
+}

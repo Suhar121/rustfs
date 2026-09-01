@@ -1,0 +1,236 @@
+name: RustFS Performance Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_url:
+        description: 'Direct .deb URL (nightly/R2). Defaults to the latest nightly deb.'
+        required: false
+        type: string
+      test_method:
+        description: 'Benchmark method(s) to run (manual runs only; "all" = GET+PUT+MIXED)'
+        type: choice
+        options:
+          - all
+          - get
+          - put
+          - mixed
+        default: 'all'
+      object_size:
+        description: 'Object size(s) to test (manual runs only; "all" = all 10 sizes)'
+        type: choice
+        options:
+          - all
+          - 1KiB
+          - 4KiB
+          - 16KiB
+          - 128KiB
+          - 1MiB
+          - 4MiB
+          - 8MiB
+          - 16MiB
+          - 32MiB
+          - 64MiB
+        default: 'all'
+      warp_duration:
+        description: 'warp duration per round (e.g. 5m, 30s)'
+        required: false
+        default: '5m'
+      warp_concurrency:
+        description: 'warp concurrency'
+        required: false
+        default: '64'
+      cleanup_before:
+        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
+        type: boolean
+        default: true
+      cleanup_after:
+        description: 'Reset the nodes after the test (DESTROYS test data/config)'
+        type: boolean
+        default: true
+  workflow_run:
+    # Run after the nightly build completes; the nightly deb is what the test installs.
+    workflows: ["Nightly GNU Build"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# Dedicated pf-testing runner/environment: own concurrency group so perf runs
+# never block (or are blocked by) the pool-expansion / heal tests.
+concurrency:
+  group: rustfs-performance-test
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  # Performance test uses its own node list (4 nodes); the shared
+  # RUSTFS_NODES secret is used by the 3-node pool-expansion / heal tests.
+  RUSTFS_NODES: ${{ secrets.RUSTFS_PERF_NODES || vars.RUSTFS_PERF_NODES || 'vm000 vm001 vm002 vm003' }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  # Package used by the nightly run (workflow_dispatch inputs are empty for
+  # workflow_run events), i.e. the latest nightly deb published by nightly-gnu.yml.
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  # Fixed benchmark result directory so later steps can read summary.md
+  RUSTFS_RESULT_DIR: /tmp/rustfs-perf-results
+  # Cross-repo token for uploading reports to rustfs/dashboard (set in repo settings)
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+jobs:
+  performance-test:
+    runs-on: pf-testing
+    timeout-minutes: 900
+    # Run on manual dispatch, or when the nightly build completed successfully.
+    # Skipped when nightly failed.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          warp --version || true
+          df -h /data | tail -1
+
+      - name: Reset test environment (before)
+        if: ${{ inputs.cleanup_before != 'false' }}
+        run: |
+          chmod +x auto-testing/rustfs_performance_test.sh
+          ./auto-testing/rustfs_performance_test.sh --step 1 -y
+
+      - name: Install RustFS package & start cluster (4x4)
+        run: |
+          ARGS=(--steps "2,3,4" -y)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_performance_test.sh "${ARGS[@]}"
+
+      - name: Preflight checks
+        run: |
+          ARGS=(--preflight)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_performance_test.sh "${ARGS[@]}"
+
+      - name: Run benchmark (GET/PUT/MIXED)
+        id: benchmark
+        run: |
+          # Empty on automatic (workflow_run) runs -> full 30 rounds.
+          # Manual dispatch can restrict method(s)/size(s).
+          export WARP_METHODS="${{ inputs.test_method }}"
+          export WARP_SIZES="${{ inputs.object_size }}"
+          ./auto-testing/rustfs_performance_test.sh \
+            --step 5 -y \
+            --warp-duration "${{ inputs.warp_duration || '5m' }}" \
+            --warp-concurrency "${{ inputs.warp_concurrency || '64' }}" \
+            --log-file /tmp/rustfs-perf-test.log
+
+      - name: Analyze results
+        if: ${{ steps.benchmark.conclusion == 'success' }}
+        run: |
+          ./auto-testing/rustfs_performance_test.sh --step 6 -y
+
+      - name: Collect RustFS version info
+        if: ${{ steps.benchmark.conclusion == 'success' }}
+        env:
+          VERSION_FILE: /tmp/rustfs-version.txt
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES}"
+          [ "${#NODES[@]}" -gt 0 ] || { echo "RUSTFS_NODES is empty"; exit 1; }
+          NODE="${NODES[0]}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          {
+            echo "Node: ${NODE}"
+            echo "Command: rustfs --version"
+            echo ""
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+              "${SSH_USER}@${NODE}" 'rustfs --version'
+          } > "${VERSION_FILE}"
+
+      - name: Upload report to dashboard (reports/YYYY-MM-DD.md)
+        if: ${{ steps.benchmark.conclusion == 'success' }}
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          RESULT_DIR: ${{ env.RUSTFS_RESULT_DIR }}
+          VERSION_FILE: /tmp/rustfs-version.txt
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping report upload"
+            exit 0
+          fi
+          SUMMARY="${RESULT_DIR}/summary.md"
+          [ -f "${SUMMARY}" ] || { echo "summary.md not found at ${SUMMARY}"; exit 1; }
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="reports/${DATE}.md"
+          {
+            echo "# RustFS nightly build performance testing report"
+            echo ""
+            echo "- **Date**: ${DATE}"
+            echo "- **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- **Trigger**: ${{ github.event_name }}"
+            echo "- **Package**: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+            echo ""
+            cat "${SUMMARY}"
+            echo ""
+            echo "## RustFS version"
+            echo '```text'
+            cat "${VERSION_FILE}"
+            echo '```'
+          } > /tmp/rustfs-perf-report.md
+          CONTENT="$(python3 -c 'import base64; print(base64.b64encode(open("/tmp/rustfs-perf-report.md","rb").read()).decode())')"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report: ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+            echo "updated ${REPORT_PATH} in rustfs/dashboard"
+          else
+            jq -n --arg msg "report: ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+            echo "created ${REPORT_PATH} in rustfs/dashboard"
+          fi
+
+      - name: Upload test logs & results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-perf-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-perf-test*.log
+            /tmp/rustfs-perf-results/**
+            /tmp/rustfs-version.txt
+          if-no-files-found: warn
+
+      - name: Reset test environment (after)
+        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        run: |
+          ./auto-testing/rustfs_performance_test.sh --step 7 -y
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS performance test failed"
+          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+          echo "See the uploaded log artifact for details."
