@@ -418,27 +418,12 @@ pub mod default {
                         Statement {
                             sid: "".into(),
                             effect: Effect::Allow,
-                            actions: ActionSet(vec![
-                                Action::S3Action(S3Action::CreateBucketAction),
-                                Action::S3Action(S3Action::DeleteBucketAction),
-                                Action::S3Action(S3Action::ListBucketAction),
-                                Action::S3Action(S3Action::GetBucketLocationAction),
-                            ]),
+                            actions: ActionSet(vec![Action::S3Action(S3Action::AllActions)]),
                             not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(vec![Resource::S3("${aws:username}-*".into())]),
-                            conditions: Functions::default(),
-                            ..Default::default()
-                        },
-                        Statement {
-                            sid: "".into(),
-                            effect: Effect::Allow,
-                            actions: ActionSet(vec![
-                                Action::S3Action(S3Action::GetObjectAction),
-                                Action::S3Action(S3Action::PutObjectAction),
-                                Action::S3Action(S3Action::DeleteObjectAction),
+                            resources: ResourceSet(vec![
+                                Resource::S3("${aws:username}-*".into()),
+                                Resource::S3("${aws:username}-*/*".into()),
                             ]),
-                            not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(vec![Resource::S3("${aws:username}-*/*".into())]),
                             conditions: Functions::default(),
                             ..Default::default()
                         },
@@ -458,18 +443,14 @@ pub mod default {
                             actions: ActionSet(vec![
                                 Action::S3Action(S3Action::ListBucketAction),
                                 Action::S3Action(S3Action::GetBucketLocationAction),
+                                Action::S3Action(S3Action::GetObjectAction),
+                                Action::S3Action(S3Action::GetObjectVersionAction),
                             ]),
                             not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(vec![Resource::S3("${aws:username}-*".into())]),
-                            conditions: Functions::default(),
-                            ..Default::default()
-                        },
-                        Statement {
-                            sid: "".into(),
-                            effect: Effect::Allow,
-                            actions: ActionSet(vec![Action::S3Action(S3Action::GetObjectAction)]),
-                            not_actions: ActionSet(Default::default()),
-                            resources: ResourceSet(vec![Resource::S3("${aws:username}-*/*".into())]),
+                            resources: ResourceSet(vec![
+                                Resource::S3("${aws:username}-*".into()),
+                                Resource::S3("${aws:username}-*/*".into()),
+                            ]),
                             conditions: Functions::default(),
                             ..Default::default()
                         },
