@@ -60,7 +60,24 @@ static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 fn main() {
     let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
 
-    rustfs::startup_entrypoint::run_process();
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    let run_handle = std::thread::Builder::new()
+        .name("rustfs-main".to_string())
+        .stack_size(STACK_SIZE)
+        .spawn(|| {
+            rustfs::startup_entrypoint::run_process();
+        });
+
+    match run_handle {
+        Ok(handle) => {
+            if let Err(e) = handle.join() {
+                std::panic::resume_unwind(e);
+            }
+        }
+        Err(_) => {
+            rustfs::startup_entrypoint::run_process();
+        }
+    }
 }
 
 #[cfg(all(test, feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
