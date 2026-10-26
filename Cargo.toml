@@ -245,7 +245,7 @@ aws-smithy-http-client = { default-features = false, version = "1.4.0" }
 aws-smithy-runtime-api = { version = "1.15.0" }
 aws-smithy-types = { version = "1.6.2" }
 base64-simd = "0.8.0"
-brotli = "8.0.4"
+brotli = "9.0.0"
 clap = { version = "4.6.6" }
 const-str = { version = "1.1.0" }
 convert_case = "0.12.0"
@@ -257,7 +257,7 @@ crossbeam-utils = "0.8.22"
 datafusion = { default-features = false, version = "55.0.0" }
 derive_builder = "0.20.2"
 enumset = "1.1.14"
-faster-hex = "0.10.0"
+faster-hex = "1.0.0"
 flate2 = "1.1.10"
 glob = "0.3.4"
 google-cloud-storage = "1.18.0"
@@ -284,7 +284,7 @@ moka = { version = "0.12.16" }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.13.0"
-parking_lot = "0.12.5"
+parking_lot = "0.13.0"
 path-absolutize = "4.0.1"
 percent-encoding = "2.3.2"
 # Server-side QR rendering for TOTP enrollment, so neither the console nor the
@@ -323,7 +323,7 @@ tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
 tracing-core = "0.1.36"
 tracing-error = "0.2.1"
-tracing-opentelemetry = { version = "0.33" }
+tracing-opentelemetry = { version = "0.34" }
 tracing-subscriber = { version = "0.3.23" }
 transform-stream = "0.3.1"
 url = "2.5.8"
@@ -336,36 +336,36 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.18" }
-zip = "8.6.0"
-zstd = "0.13.3"
+zip = "9.0.5"
+zstd = "0.14.3"
 
 # Observability and Metrics
 metrics = "0.24.6"
 metrics-util = "0.20"
 dial9-tokio-telemetry = "0.5.0"
-opentelemetry = { version = "0.32.0" }
-opentelemetry-appender-tracing = { version = "0.32.0" }
-opentelemetry-otlp = { version = "0.32.0" }
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["metrics", "gen-tonic-messages"] }
-opentelemetry_sdk = { version = "0.32.1" }
-opentelemetry-semantic-conventions = { version = "0.32.1" }
-opentelemetry-stdout = { version = "0.32.0" }
+opentelemetry = { version = "0.33.1" }
+opentelemetry-appender-tracing = { version = "0.33.1" }
+opentelemetry-otlp = { version = "0.33.1" }
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["metrics", "gen-tonic-messages"] }
+opentelemetry_sdk = { version = "0.33.1" }
+opentelemetry-semantic-conventions = { version = "0.33.1" }
+opentelemetry-stdout = { version = "0.33.1" }
 pyroscope = { version = "2.1.1" }
 
 # FTP and SFTP
 libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
-suppaftp = { version = "11.0.0" }
+suppaftp = { version = "12.2.1" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.63.1" }
+russh = { version = "0.64.1" }
 russh-sftp = "2.4.0"
 
 # WebDAV
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.5.1" }
-hotpath = { version = "0.24.0", default-features = false }
+rustfs-mimalloc = { version = "0.7.1" }
+hotpath = { version = "0.29.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }
 
